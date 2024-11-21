@@ -600,6 +600,59 @@ class GaussianModel:
             self._opacity = self.get_opacity.clone().half().float()
         torch.cuda.empty_cache()
         return mb_str
+
+    # 仅仅为测试计算size
+    def final_prune_for_test(self, compress=False):
+        # prune_mask = (torch.sigmoid(self._mask) <= 0.01).squeeze()
+        # self.prune_points(prune_mask)
+        if compress:
+            self.sort_morton()
+
+        for m in self.vq_scale.layers:
+            m.training = False
+        for m in self.vq_rot.layers:
+            m.training = False
+
+        self._xyz = self._xyz.clone().half().float()
+        self._scaling, self.sca_idx, _ = self.vq_scale(self.get_scaling.unsqueeze(1))
+        self._rotation, self.rot_idx, _ = self.vq_rot(self.get_rotation.unsqueeze(1))
+        self._scaling = self._scaling.squeeze()
+        self._rotation = self._rotation.squeeze()
+
+        position_mb = self._xyz.shape[0] * 3 * 16 / 8 / 10 ** 6
+        scale_mb = self._xyz.shape[
+                       0] * self.rvq_bit * self.rvq_num / 8 / 10 ** 6 + 2 ** self.rvq_bit * self.rvq_num * 3 * 32 / 8 / 10 ** 6
+        rotation_mb = self._xyz.shape[
+                          0] * self.rvq_bit * self.rvq_num / 8 / 10 ** 6 + 2 ** self.rvq_bit * self.rvq_num * 4 * 32 / 8 / 10 ** 6
+        opacity_mb = self._xyz.shape[0] * 16 / 8 / 10 ** 6
+        hash_mb = self.recolor.params.shape[0] * 16 / 8 / 10 ** 6
+        mlp_mb = self.mlp_head.params.shape[0] * 16 / 8 / 10 ** 6
+        sum_mb = position_mb + scale_mb + rotation_mb + opacity_mb + hash_mb + mlp_mb
+
+        mb_str = "Storage\nposition: " + str(position_mb) + "\nscale: " + str(scale_mb) + "\nrotation: " + str(
+            rotation_mb) + "\nopacity: " + str(opacity_mb) + "\nhash: " + str(hash_mb) + "\nmlp: " + str(
+            mlp_mb) + "\ntotal: " + str(sum_mb) + " MB"
+
+        if compress:
+            self._opacity, self.quant_opa, self.minmax_opa = self.post_quant(self.get_opacity)
+            self.recolor.params, self.quant_hash, self.minmax_hash = self.post_quant(self.recolor.params, True)
+
+            scale_mb, self.huf_sca, self.tab_sca = self.huffman_encode(self.sca_idx)
+            scale_mb += 2 ** self.rvq_bit * self.rvq_num * 3 * 32 / 8 / 10 ** 6
+            rotation_mb, self.huf_rot, self.tab_rot = self.huffman_encode(self.rot_idx)
+            rotation_mb += 2 ** self.rvq_bit * self.rvq_num * 4 * 32 / 8 / 10 ** 6
+            opacity_mb, self.huf_opa, self.tab_opa = self.huffman_encode(self.quant_opa)
+            hash_mb, self.huf_hash, self.tab_hash = self.huffman_encode(self.quant_hash)
+            mlp_mb = self.mlp_head.params.shape[0] * 16 / 8 / 10 ** 6
+            sum_mb = position_mb + scale_mb + rotation_mb + opacity_mb + hash_mb + mlp_mb
+
+            mb_str = mb_str + "\n\nAfter PP\nposition: " + str(position_mb) + "\nscale: " + str(
+                scale_mb) + "\nrotation: " + str(rotation_mb) + "\nopacity: " + str(opacity_mb) + "\nhash: " + str(
+                hash_mb) + "\nmlp: " + str(mlp_mb) + "\ntotal: " + str(sum_mb) + " MB"
+        else:
+            self._opacity = self.get_opacity.clone().half().float()
+        torch.cuda.empty_cache()
+        return mb_str
     
     def precompute(self):
         xyz = self.contract_to_unisphere(self.get_xyz.half(), torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))

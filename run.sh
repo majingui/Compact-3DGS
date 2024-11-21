@@ -11,3 +11,9 @@ CUDA_VISIBLE_DEVICES=3 python render.py --iteration 30000 -s /data2/mjg/data/dat
 
 # 评估
 CUDA_VISIBLE_DEVICES=5 python metrics.py -m /data2/mjg/work_space/3dgs/Compact-3DGS/output/e8f8d0c1-f
+
+
+# 计算size
+CUDA_VISIBLE_DEVICES=3 python compute_size.py --iteration 30000 -s /data2/mjg/data/dataset/mipnerf360/kitchen -m /data2/mjg/work_space/3dgs/Compact-3DGS/output/e8f8d0c1-f  --quiet --eval --skip_train
+
+# 注意 train的时候，是否后处理没有关系，compute_size的时候会自动计算PP前后的大小
