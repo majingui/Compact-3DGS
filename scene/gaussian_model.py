@@ -599,6 +599,7 @@ class GaussianModel:
         else:
             self._opacity = self.get_opacity.clone().half().float()
         torch.cuda.empty_cache()
+        print(mb_str)
         return mb_str
     
     def precompute(self):
