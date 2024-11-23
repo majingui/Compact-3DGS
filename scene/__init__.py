@@ -92,7 +92,7 @@ class Scene:
                 self.gaussians.save_npz(os.path.join(point_cloud_path, "point_cloud"))
         else:
             self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-            torch.save(torch.nn.ModuleList([self.gaussians.recolor, self.gaussians.mlp_head]).state_dict(), os.path.join(point_cloud_path, "point_cloud.pth")) 
+            torch.save(torch.nn.ModuleList([self.gaussians.recolor, self.gaussians.mlp_head, self.gaussians.mlp_geo]).state_dict(), os.path.join(point_cloud_path, "point_cloud.pth"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

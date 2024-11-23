@@ -99,6 +99,17 @@ class GaussianModel:
                     "n_hidden_layers": 2,
                 },
             )
+        self.mlp_geo = tcnn.Network(
+            n_input_dims= self.recolor.n_output_dims,
+            n_output_dims=7,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": 32,
+                "n_hidden_layers": 2,
+            }
+        )
 
     def capture(self):
         return (
@@ -187,6 +198,8 @@ class GaussianModel:
             other_params.append(params)
         for params in self.mlp_head.parameters():
             other_params.append(params)
+        for params in self.mlp_geo.parameters():
+            other_params.append(params)
             
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -260,6 +273,7 @@ class GaussianModel:
         save_dict["rotation"] = np.packbits(np.unpackbits(self.rot_idx.unsqueeze(-1).cpu().numpy().astype(np.uint8), axis=-1, count=int(self.rvq_bit), bitorder='little').flatten(), axis=None)
         save_dict["hash"] = self.recolor.params.cpu().half().numpy()
         save_dict["mlp"] = self.mlp_head.params.cpu().half().numpy()
+        save_dict["mlp_geo"] = self.mlp_geo.params.cpu().half().numpy()
         save_dict["codebook_scale"] = self.vq_scale.cpu().state_dict()
         save_dict["codebook_rotation"] = self.vq_rot.cpu().state_dict()
         save_dict["rvq_info"] = np.array([int(self.rvq_num), int(self.rvq_bit)])
@@ -277,6 +291,7 @@ class GaussianModel:
         save_dict["rotation"] = np.frombuffer(self.huf_rot, dtype=np.uint8)
         save_dict["hash"] = np.frombuffer(self.huf_hash, dtype=np.uint8)
         save_dict["mlp"] = self.mlp_head.params.cpu().half().numpy()
+        save_dict["mlp_geo"] = self.mlp_geo.params.cpu().half().numpy()
         save_dict["huftable_opacity"] = self.tab_opa
         save_dict["huftable_scale"] = self.tab_sca
         save_dict["huftable_rotation"] = self.tab_rot
@@ -328,6 +343,7 @@ class GaussianModel:
             self._rotation = nn.Parameter(rotation.squeeze(1).requires_grad_(True))
             self.recolor.params = nn.Parameter(hashgrid.cuda().half().requires_grad_(True))
             self.mlp_head.params = nn.Parameter(torch.from_numpy(load_dict["mlp"]).cuda().half().requires_grad_(True))
+            self.mlp_geo.params = nn.Parameter(torch.from_numpy(load_dict["mlp_geo"]).cuda().half().requires_grad_(True))
         elif os.path.isfile(path + '.npz'):
             path = path + '.npz'
             print("Loading ", path)
@@ -349,6 +365,7 @@ class GaussianModel:
             self._rotation = nn.Parameter(rotation.squeeze(1).requires_grad_(True))
             self.recolor.params = nn.Parameter(torch.from_numpy(load_dict["hash"]).cuda().half().requires_grad_(True))
             self.mlp_head.params = nn.Parameter(torch.from_numpy(load_dict["mlp"]).cuda().half().requires_grad_(True))
+            self.mlp_geo.params = nn.Parameter(torch.from_numpy(load_dict["mlp_geo"]).cuda().half().requires_grad_(True))
         else:
             self.load_ply(path)
             
@@ -380,7 +397,7 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
-        torch.nn.ModuleList([self.recolor, self.mlp_head]).load_state_dict(torch.load(path +".pth"))
+        torch.nn.ModuleList([self.recolor, self.mlp_head, self.mlp_geo]).load_state_dict(torch.load(path +".pth"))
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -567,32 +584,34 @@ class GaussianModel:
             m.training = False
 
         self._xyz = self._xyz.clone().half().float()
-        self._scaling, self.sca_idx, _ = self.vq_scale(self.get_scaling.unsqueeze(1))
-        self._rotation, self.rot_idx, _ = self.vq_rot(self.get_rotation.unsqueeze(1))
-        self._scaling = self._scaling.squeeze()
-        self._rotation = self._rotation.squeeze()
+        # self._scaling, self.sca_idx, _ = self.vq_scale(self.get_scaling.unsqueeze(1))
+        # self._rotation, self.rot_idx, _ = self.vq_rot(self.get_rotation.unsqueeze(1))
+        # self._scaling = self._scaling.squeeze()
+        # self._rotation = self._rotation.squeeze()
 
+        scale_mb = 0
+        rotation_mb = 0
         position_mb = self._xyz.shape[0]*3*16/8/10**6
-        scale_mb = self._xyz.shape[0]*self.rvq_bit*self.rvq_num/8/10**6 + 2**self.rvq_bit*self.rvq_num*3*32/8/10**6
-        rotation_mb = self._xyz.shape[0]*self.rvq_bit*self.rvq_num/8/10**6 + 2**self.rvq_bit*self.rvq_num*4*32/8/10**6
+        # scale_mb = self._xyz.shape[0]*self.rvq_bit*self.rvq_num/8/10**6 + 2**self.rvq_bit*self.rvq_num*3*32/8/10**6
+        # rotation_mb = self._xyz.shape[0]*self.rvq_bit*self.rvq_num/8/10**6 + 2**self.rvq_bit*self.rvq_num*4*32/8/10**6
         opacity_mb = self._xyz.shape[0]*16/8/10**6
         hash_mb = self.recolor.params.shape[0]*16/8/10**6
-        mlp_mb = self.mlp_head.params.shape[0]*16/8/10**6
+        mlp_mb = self.mlp_head.params.shape[0]*16/8/10**6 + self.mlp_geo.params.shape[0]*16/8/10**6
         sum_mb = position_mb+scale_mb+rotation_mb+opacity_mb+hash_mb+mlp_mb
-        
+
         mb_str = "Storage\nposition: "+str(position_mb)+"\nscale: "+str(scale_mb)+"\nrotation: "+str(rotation_mb)+"\nopacity: "+str(opacity_mb)+"\nhash: "+str(hash_mb)+"\nmlp: "+str(mlp_mb)+"\ntotal: "+str(sum_mb)+" MB"
         
         if compress:
             self._opacity, self.quant_opa, self.minmax_opa = self.post_quant(self.get_opacity)
             self.recolor.params, self.quant_hash, self.minmax_hash = self.post_quant(self.recolor.params, True)
         
-            scale_mb, self.huf_sca, self.tab_sca = self.huffman_encode(self.sca_idx) 
-            scale_mb += 2**self.rvq_bit*self.rvq_num*3*32/8/10**6
-            rotation_mb, self.huf_rot, self.tab_rot = self.huffman_encode(self.rot_idx)
-            rotation_mb += 2**self.rvq_bit*self.rvq_num*4*32/8/10**6
+            # scale_mb, self.huf_sca, self.tab_sca = self.huffman_encode(self.sca_idx)
+            # scale_mb += 2**self.rvq_bit*self.rvq_num*3*32/8/10**6
+            # rotation_mb, self.huf_rot, self.tab_rot = self.huffman_encode(self.rot_idx)
+            # rotation_mb += 2**self.rvq_bit*self.rvq_num*4*32/8/10**6
             opacity_mb, self.huf_opa, self.tab_opa = self.huffman_encode(self.quant_opa)
             hash_mb, self.huf_hash, self.tab_hash = self.huffman_encode(self.quant_hash)
-            mlp_mb = self.mlp_head.params.shape[0]*16/8/10**6
+            mlp_mb = self.mlp_head.params.shape[0]*16/8/10**6 + self.mlp_geo.params.shape[0]*16/8/10**6
             sum_mb = position_mb+scale_mb+rotation_mb+opacity_mb+hash_mb+mlp_mb
             
             mb_str = mb_str+"\n\nAfter PP\nposition: "+str(position_mb)+"\nscale: "+str(scale_mb)+"\nrotation: "+str(rotation_mb)+"\nopacity: "+str(opacity_mb)+"\nhash: "+str(hash_mb)+"\nmlp: "+str(mlp_mb)+"\ntotal: "+str(sum_mb)+" MB"

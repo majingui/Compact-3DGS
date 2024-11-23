@@ -54,33 +54,35 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     cov3D_precomp = None
 
-    if itr == -1:
-        scales = pc._scaling
-        rotations = pc._rotation
+    if itr == -1: # 测试的时候是-1
+        # scales = pc._scaling
+        # rotations = pc._rotation
         opacity = pc._opacity
         
         dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
         dir_pp = dir_pp/dir_pp.norm(dim=1, keepdim=True)
         shs = pc.mlp_head(torch.cat([pc._feature, pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
-        
+        xyz = pc.contract_to_unisphere(means3D.clone().detach(),torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
+        scales, rotations = torch.split(pc.mlp_geo(pc.recolor(xyz)), split_size_or_sections=[3, 4], dim=-1)
     else:
         mask = ((torch.sigmoid(pc._mask) > 0.01).float()- torch.sigmoid(pc._mask)).detach() + torch.sigmoid(pc._mask)
         if rvq_iter:
-            scales = pc.vq_scale(pc.get_scaling.unsqueeze(0))[0]
-            rotations = pc.vq_rot(pc.get_rotation.unsqueeze(0))[0]
-            scales = scales.squeeze()*mask
-            rotations = rotations.squeeze()
+            # scales = pc.vq_scale(pc.get_scaling.unsqueeze(0))[0]
+            # rotations = pc.vq_rot(pc.get_rotation.unsqueeze(0))[0]
+            # scales = scales.squeeze()*mask
+            # rotations = rotations.squeeze()
             opacity = pc.get_opacity*mask
 
         else:
-            scales = pc.get_scaling*mask
-            rotations = pc.get_rotation
+            # scales = pc.get_scaling*mask
+            # rotations = pc.get_rotation
             opacity = pc.get_opacity*mask
             
         xyz = pc.contract_to_unisphere(means3D.clone().detach(), torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
         dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
         dir_pp = dir_pp/dir_pp.norm(dim=1, keepdim=True)
         shs = pc.mlp_head(torch.cat([pc.recolor(xyz), pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
+        scales, rotations = torch.split(pc.mlp_geo(pc.recolor(xyz)), split_size_or_sections=[3,4], dim=-1)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(
@@ -89,8 +91,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         shs = shs.float(),
         colors_precomp = None,
         opacities = opacity,
-        scales = scales,
-        rotations = rotations,
+        scales = scales.float(),
+        rotations = rotations.float(),
         cov3D_precomp = None)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
