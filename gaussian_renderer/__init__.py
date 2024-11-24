@@ -14,8 +14,11 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from arguments import WARM_UP_ITERATIONS, FINE_TUNE_ITERATIONS
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, itr=-1, rvq_iter=False):
+# WARM_UP_ITERATIONS = 30_000
+# FINE_TUNE_ITERATIONS = 20_000
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, itr=-1, rvq_iter=False, test_use_predict = False):
     """
     Render the scene. 
     
@@ -54,16 +57,45 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     cov3D_precomp = None
 
+    predict_scale = None
+    predict_rotation = None
+
     if itr == -1: # 测试的时候是-1
-        # scales = pc._scaling
-        # rotations = pc._rotation
-        opacity = pc._opacity
-        
+        if test_use_predict:
+            # scales = pc._scaling
+            # rotations = pc._rotation
+            pc.precompute()
+            opacity = pc._opacity
+
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
+            dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            shs = pc.mlp_head(torch.cat([pc._feature, pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
+            xyz = pc.contract_to_unisphere(means3D.clone().detach(),
+                                           torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
+            scales, rotations = torch.split(pc.mlp_geo(pc.recolor(xyz)), split_size_or_sections=[3, 4], dim=-1)
+        else:
+            scales = pc.get_scaling
+            rotations = pc.get_rotation
+            pc.precompute()
+            opacity = pc._opacity
+
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
+            dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            print()
+            shs = pc.mlp_head(torch.cat([pc._feature, pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
+
+    elif itr <= WARM_UP_ITERATIONS:
+        mask = ((torch.sigmoid(pc._mask) > 0.01).float() - torch.sigmoid(pc._mask)).detach() + torch.sigmoid(pc._mask)
+
+        scales = pc.get_scaling*mask
+        rotations = pc.get_rotation
+        opacity = pc.get_opacity * mask
+
+        xyz = pc.contract_to_unisphere(means3D.clone().detach(),
+                                       torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
         dir_pp = (means3D - viewpoint_camera.camera_center.repeat(means3D.shape[0], 1))
-        dir_pp = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-        shs = pc.mlp_head(torch.cat([pc._feature, pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
-        xyz = pc.contract_to_unisphere(means3D.clone().detach(),torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], device='cuda'))
-        scales, rotations = torch.split(pc.mlp_geo(pc.recolor(xyz)), split_size_or_sections=[3, 4], dim=-1)
+        dir_pp = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+        shs = pc.mlp_head(torch.cat([pc.recolor(xyz), pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
     else:
         mask = ((torch.sigmoid(pc._mask) > 0.01).float()- torch.sigmoid(pc._mask)).detach() + torch.sigmoid(pc._mask)
         if rvq_iter:
@@ -83,7 +115,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         dir_pp = dir_pp/dir_pp.norm(dim=1, keepdim=True)
         shs = pc.mlp_head(torch.cat([pc.recolor(xyz), pc.direction_encoding(dir_pp)], dim=-1)).unsqueeze(1)
         scales, rotations = torch.split(pc.mlp_geo(pc.recolor(xyz)), split_size_or_sections=[3,4], dim=-1)
-
+        predict_scale,predict_rotation = scales.float(), rotations.float()
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii = rasterizer(
         means3D = means3D.float(),
@@ -100,5 +132,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
-            "radii": radii
+            "radii": radii,
+            "predict_scale": predict_scale,
+            "predict_rotation": predict_rotation,
             }

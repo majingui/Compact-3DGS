@@ -18,10 +18,11 @@ import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
+import torch.nn.functional as F
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, OptimizationParams,WARM_UP_ITERATIONS,FINE_TUNE_ITERATIONS
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -48,7 +49,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
+        if iteration == WARM_UP_ITERATIONS + 1:
+            gaussians.stop_gradient()
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -84,12 +87,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, itr=iteration, rvq_iter=False)
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, itr=iteration, rvq_iter=True)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        image, viewspace_point_tensor, visibility_filter, radii, predict_scale, predict_rotation = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["predict_scale"],render_pkg["predict_rotation"]
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + opt.lambda_mask*torch.mean((torch.sigmoid(gaussians._mask)))
+        if iteration > WARM_UP_ITERATIONS:
+            loss = loss + 0.0005 * (F.mse_loss(predict_scale, gaussians.get_scaling) + F.mse_loss(predict_rotation, gaussians.get_rotation))
         loss.backward()
 
         iter_end.record()
@@ -105,12 +110,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             if iteration == opt.iterations:
                 storage = gaussians.final_prune(compress=comp)
-                with open(os.path.join(args.model_path, "storage"), 'w') as c:
+                with open(os.path.join(dataset.model_path, "storage"), 'a') as c:
                     c.write(storage)
                 gaussians.precompute()
                 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            test_result_msg = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            # print(dataset.model_path) # 这里路径空了导致存在了项目根目录下
+            with open(os.path.join(dataset.model_path, "output.txt"), 'a') as c:
+                c.write(test_result_msg)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, compress=comp, store=store_npz)
@@ -165,23 +173,28 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+    test_result = ""
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    if iteration in testing_iterations:
+    # if iteration in testing_iterations:
+    if iteration % 2000 == 0:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
+        if iteration > WARM_UP_ITERATIONS:
+            test_use_predict = True
+        else:
+            testing_iterations = False
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, test_use_predict = testing_iterations, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -190,8 +203,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                l1_test /= len(config['cameras'])
+                msg = "\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test)
+                print(msg)
+                test_result = test_result + msg
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -200,6 +215,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+    return test_result
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -211,8 +227,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[WARM_UP_ITERATIONS,WARM_UP_ITERATIONS + FINE_TUNE_ITERATIONS])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[WARM_UP_ITERATIONS, WARM_UP_ITERATIONS + FINE_TUNE_ITERATIONS])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
